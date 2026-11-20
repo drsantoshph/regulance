@@ -15,7 +15,7 @@ export default function App() {
   const [endDate, setEndDate] = useState(todayISO());
   const [includeUndated, setIncludeUndated] = useState(true);
   const [includeDocs, setIncludeDocs] = useState(true);
-  const [model, setModel] = useState("gemini-2.5-flash");
+  const [model, setModel] = useState("gemini-3.5-flash-lite");
 
   const [statusMsg, setStatusMsg] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
@@ -194,9 +194,9 @@ export default function App() {
         <div>
           <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>AI Model</label>
           <select value={model} onChange={(e) => setModel(e.target.value)}>
-            <option value="gemini-2.5-flash">Gemini 2.5 Flash (Default)</option>
-            <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash-Lite (Fastest)</option>
-            <option value="gemini-2.5-pro">Gemini 2.5 Pro (Detailed)</option>
+            <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite (Fastest)</option>
+            <option value="gemini-3.8-flash">Gemini 3.8 Flash (Balanced)</option>
+            <option value="gemini-4-hydrogen">Gemini 4 Hydrogen (Detailed)</option>
           </select>
         </div>
       </section>
