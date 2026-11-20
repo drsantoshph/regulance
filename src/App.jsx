@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { parseIngredientsFromExcel, buildRegulanceZip } from "./utils/excelAndZip";
+
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysAgoISO = (days) => {
   const d = new Date(Date.now() - days * 86400000);
@@ -98,7 +99,7 @@ export default function App() {
 
     setIsRunning(true);
     try {
-      setStatusMsg("Fetching target pages and running Gemini PV assessment...");
+      setStatusMsg("Fetching target pages, following links, and running Gemini PV assessment...");
       const res = await fetch("/api/monitor", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -112,9 +113,18 @@ export default function App() {
         })
       });
 
-      const data = await res.json();
+      const rawText = await res.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new Error(
+          `Server error (HTTP ${res.status}): ${rawText.slice(0, 220) || "Empty or non-JSON response from /api/monitor"}`
+        );
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || "Monitoring request failed.");
+        throw new Error(data.error || `Monitoring request failed (HTTP ${res.status}).`);
       }
 
       setResults(data);
@@ -133,7 +143,7 @@ export default function App() {
       setZipUrl(objectUrl);
       setStatusMsg(`Done. Found ${(data.findings || []).length} matching item(s). ZIP ready for download.`);
     } catch (err) {
-      setErrorMsg(err.message);
+      setErrorMsg(err.message || "Unexpected error during monitoring.");
     } finally {
       setIsRunning(false);
     }
@@ -182,9 +192,9 @@ export default function App() {
           <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
         </div>
         <div>
-          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>AI Model (Free Tier)</label>
+          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>AI Model</label>
           <select value={model} onChange={(e) => setModel(e.target.value)}>
-            <option value="gemini-2.5-flash">Gemini 2.5 Flash (Recommended)</option>
+            <option value="gemini-2.5-flash">Gemini 2.5 Flash (Default)</option>
             <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash-Lite (Fastest)</option>
             <option value="gemini-2.5-pro">Gemini 2.5 Pro (Detailed)</option>
           </select>
@@ -255,9 +265,16 @@ export default function App() {
               </div>
               <p style={{ margin: "0.4rem 0" }}>{f.pvSummary}</p>
               <div style={{ fontSize: 13 }}>Action: {f.recommendedAction}</div>
-              <a href={f.itemUrl} target="_blank" rel="noreferrer" style={{ fontSize: 13 }}>
-                Open Source Link
-              </a>
+              <div style={{ display: "flex", gap: "1rem", marginTop: 6, fontSize: 13 }}>
+                <a href={f.itemUrl} target="_blank" rel="noreferrer">
+                  Open Source Link
+                </a>
+                {f.docUrl && (
+                  <a href={f.docUrl} target="_blank" rel="noreferrer">
+                    Supporting Document
+                  </a>
+                )}
+              </div>
             </div>
           ))}
         </section>
