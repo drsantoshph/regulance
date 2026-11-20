@@ -1,132 +1,418 @@
-import * as XLSX from "xlsx";
-import JSZip from "jszip";
+import * as cheerio from "cheerio";
 
-export async function parseIngredientsFromExcel(file) {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: "array" });
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
+const DEFAULT_MODEL = "gemini-2.5-flash";
+const MAX_ARTICLES_PER_SOURCE = 4;
+const FETCH_TIMEOUT_MS = 6500;
 
-  const ingredients = new Set();
-  for (const row of rows) {
-    for (const cell of row || []) {
-      const val = String(cell || "").trim();
-      if (!val) continue;
-      if (/^(active\s*ingredient|ingredient|substance|inn|drug|medicine)s?$/i.test(val)) {
-        continue;
-      }
-      ingredients.add(val);
+function isSafeExternalUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host.endsWith(".local") ||
+      host.startsWith("127.") ||
+      host.startsWith("10.") ||
+      host.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return false;
     }
+    return true;
+  } catch {
+    return false;
   }
-  return Array.from(ingredients);
 }
 
-function sanitizeFilename(name) {
-  return String(name || "document")
-    .replace(/[^a-zA-Z0-9._-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 60) || "document";
+async function fetchTextWithTimeout(url, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      }
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-export async function buildRegulanceZip({
-  findings,
-  sourceStatuses,
+function normalizeIsoDate(raw) {
+  if (!raw) return "";
+  const str = String(raw).trim();
+
+  const isoMatch = str.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (isoMatch) return isoMatch[1];
+
+  const dmyMatch = str.match(/\b([0-2]?\d|3[01])\/(0?\d|1[0-2])\/(20\d{2})\b/);
+  if (dmyMatch) {
+    const dd = dmyMatch[1].padStart(2, "0");
+    const mm = dmyMatch[2].padStart(2, "0");
+    return `${dmyMatch[3]}-${mm}-${dd}`;
+  }
+
+  const parsed = Date.parse(str);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toISOString().slice(0, 10);
+  }
+  return "";
+}
+
+function isDateInRange(isoDate, startDate, endDate) {
+  if (!isoDate) return false;
+  return isoDate >= startDate && isoDate <= endDate;
+}
+
+function extractArticleLinksFromListing(html, listingUrl) {
+  const $ = cheerio.load(html);
+  const found = new Map();
+
+  $("a[href]").each((_, el) => {
+    const href = ($(el).attr("href") || "").trim();
+    if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("javascript:")) {
+      return;
+    }
+
+    let absUrl = "";
+    try {
+      absUrl = new URL(href, listingUrl).toString();
+    } catch {
+      return;
+    }
+
+    if (!isSafeExternalUrl(absUrl)) return;
+
+    const parsed = new URL(absUrl);
+    const path = parsed.pathname.toLowerCase();
+
+    const isEmaNewsArticle =
+      parsed.hostname.endsWith("ema.europa.eu") &&
+      path.startsWith("/en/news/") &&
+      path.length > "/en/news/".length &&
+      !path.includes("/search");
+
+    const isGenericArticlePath =
+      !parsed.hostname.endsWith("ema.europa.eu") &&
+      (path.includes("/news/") || path.includes("/press-release") || path.includes("/safety"));
+
+    if (!isEmaNewsArticle && !isGenericArticlePath) return;
+
+    const linkText = $(el).text().replace(/\s+/g, " ").trim();
+    if (!linkText || linkText.length < 8) return;
+
+    const container = $(el).closest("article, li, tr, .views-row, div");
+    const timeEl = container.find("time").first();
+    const dateHint =
+      timeEl.attr("datetime") ||
+      timeEl.text().trim() ||
+      container.text().replace(/\s+/g, " ").trim().slice(0, 260);
+    const normalizedDate = normalizeIsoDate(dateHint);
+
+    const cleanKey = `${parsed.origin}${parsed.pathname}`;
+    if (!found.has(cleanKey)) {
+      found.set(cleanKey, {
+        title: linkText,
+        url: absUrl,
+        listingDate: normalizedDate,
+        rawDateHint: dateHint || "Not stated on listing"
+      });
+    }
+  });
+
+  return Array.from(found.values());
+}
+
+function extractArticleDetails(html, articleUrl) {
+  const $ = cheerio.load(html);
+  $("script, style, nav, footer, noscript, iframe, svg").remove();
+
+  const title =
+    $("h1").first().text().replace(/\s+/g, " ").trim() ||
+    $("title").first().text().replace(/\s+/g, " ").trim() ||
+    "Untitled Article";
+
+  const mainEl = $("main, article, .region-content, #block-system-main").first();
+  const bodyRoot = mainEl.length ? mainEl : $("body");
+  const fullText = bodyRoot.text().replace(/\s+/g, " ").trim();
+
+  const timeAttr = $("time[datetime]").first().attr("datetime");
+  const timeText = $("time").first().text().replace(/\s+/g, " ").trim();
+  const articleDate =
+    normalizeIsoDate(timeAttr) ||
+    normalizeIsoDate(timeText) ||
+    normalizeIsoDate(fullText.slice(0, 600));
+
+  const docLinks = [];
+  const seenDocs = new Set();
+
+  bodyRoot.find("a[href]").each((_, el) => {
+    const rawHref = ($(el).attr("href") || "").trim();
+    if (!rawHref) return;
+
+    let absDocUrl = "";
+    try {
+      absDocUrl = new URL(rawHref, articleUrl).toString();
+    } catch {
+      return;
+    }
+
+    if (!isSafeExternalUrl(absDocUrl)) return;
+
+    const lowerUrl = absDocUrl.toLowerCase();
+    const linkLabel = $(el).text().replace(/\s+/g, " ").trim();
+    const looksLikePdf =
+      lowerUrl.includes(".pdf") ||
+      lowerUrl.includes("/en/documents/") ||
+      /\bpdf\b/i.test(linkLabel);
+
+    if (looksLikePdf && !seenDocs.has(absDocUrl)) {
+      seenDocs.add(absDocUrl);
+      docLinks.push({
+        url: absDocUrl,
+        label: linkLabel || "Document"
+      });
+    }
+  });
+
+  return {
+    title,
+    articleDate,
+    rawDateHint: timeAttr || timeText || articleDate || "Not found on article",
+    textExcerpt: fullText.slice(0, 5000),
+    docLinks
+  };
+}
+
+async function assessArticleWithGemini({
+  apiKey,
+  model,
+  article,
+  sourceUrl,
   ingredients,
   startDate,
   endDate,
-  includeDocs = true,
-  onProgress = () => {}
+  includeUndated
 }) {
-  const zip = new JSZip();
-  const docsFolder = zip.folder("supporting_documents");
-  const enrichedRows = [];
-  const safeFindings = Array.isArray(findings) ? findings : [];
+  const chosenModel = (model && String(model).trim()) || DEFAULT_MODEL;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    chosenModel
+  )}:generateContent`;
 
-  if (includeDocs) {
-    let idx = 1;
-    for (const item of safeFindings) {
-      let bundledFileName = "Not Bundled";
-      if (item.docUrl) {
-        onProgress(`Fetching supporting document ${idx} of ${safeFindings.length}...`);
-        try {
-          const resp = await fetch(`/api/fetch-doc?url=${encodeURIComponent(item.docUrl)}`);
-          if (resp.ok) {
-            const respType = (resp.headers.get("content-type") || "").toLowerCase();
-            const blob = await resp.blob();
-            const isPdf =
-              respType.includes("application/pdf") ||
-              String(item.docUrl).toLowerCase().includes(".pdf");
-            const ext = isPdf ? ".pdf" : "";
-            const fileName = `${String(idx).padStart(2, "0")}_${sanitizeFilename(
-              item.matchedIngredients
-            )}_${sanitizeFilename(item.title)}${ext}`;
-            docsFolder.file(fileName, blob);
-            bundledFileName = `supporting_documents/${fileName}`;
-          } else {
-            bundledFileName = `Link Only (HTTP ${resp.status})`;
-          }
-        } catch {
-          bundledFileName = "Link Only (Fetch Failed)";
-        }
+  const prompt = `You are a Pharmacovigilance (PV) Regulatory Intelligence screening assistant.
+Given an EMA/regulatory news article and a list of active ingredients being monitored, identify which active ingredients (or their medicines/INN/synonyms) are relevant to this article, verify whether the publication date falls within [${startDate} to ${endDate}], and pick the best supporting document URL from the candidate links if applicable.
+
+Rules:
+- Only list active ingredients from the provided Monitored Active Ingredients list that have a plausible connection to the article (direct mention, class/therapeutic relevance, or safety/regulatory impact). If none are relevant, set isRelevant to false and matchedIngredients to [].
+- Never invent facts, dates, or URLs not supported by the provided text/links.
+- If no clear publication date is supported, set extractedDate to "Unknown" and dateStatus to "Undated - Verify Manually".
+- Treat output strictly as preliminary screening, never final regulatory determination.
+
+Respond ONLY with valid JSON matching this exact schema:
+{
+  "isRelevant": true,
+  "matchedIngredients": ["string"],
+  "extractedDate": "YYYY-MM-DD or Unknown",
+  "dateStatus": "In Range" | "Undated - Verify Manually" | "Out of Range",
+  "pvImpactLevel": "High" | "Medium" | "Low" | "None",
+  "pvSummary": "Concise 1-2 sentence PV screening note",
+  "recommendedAction": "Concrete next step for PV reviewer",
+  "selectedDocUrl": "URL from candidate docs or empty string"
+}
+
+Target Date Window: ${startDate} to ${endDate} (Include Undated: ${includeUndated})
+Monitored Active Ingredients: ${ingredients.join(", ")}
+Source Listing URL: ${sourceUrl}
+Article URL: ${article.url}
+Article Title: ${article.title}
+Detected Date Hint: ${article.rawDateHint}
+Candidate Document Links: ${JSON.stringify(article.docLinks.slice(0, 6))}
+Article Content: ${article.textExcerpt}`;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: "application/json"
       }
-      enrichedRows.push({ ...item, bundledFileName });
-      idx += 1;
-    }
-  } else {
-    for (const item of safeFindings) {
-      enrichedRows.push({ ...item, bundledFileName: "Skipped (Report-Only Mode)" });
-    }
+    })
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini API error (${res.status}): ${errText.slice(0, 200)}`);
   }
 
-  onProgress("Generating Excel report...");
-  const wb = XLSX.utils.book_new();
+  const data = await res.json();
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+  return JSON.parse(rawText);
+}
 
-  // Sheet 1: Summary
-  const summaryData = [
-    ["Metric", "Value"],
-    ["Monitoring Start Date", startDate],
-    ["Monitoring End Date", endDate],
-    ["Active Ingredients Screened", ingredients.length],
-    ["Matched & Retained Findings", enrichedRows.length],
-    ["Generated At (UTC)", new Date().toISOString()],
-    ["Disclaimer", "Preliminary AI screening pilot only. Verify against primary regulatory sources."]
-  ];
-  const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
-  XLSX.utils.book_append_sheet(wb, wsSummary, "Summary");
+export async function handler(event) {
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: JSON.stringify({ error: "Method Not Allowed" }) };
+  }
 
-  // Sheet 2: Findings
-  const findingsSheetData = enrichedRows.map((r) => ({
-    "Matched Active Ingredient(s)": r.matchedIngredients,
-    "Extracted Date": r.extractedDate,
-    "Date Status": r.dateStatus,
-    "PV Impact Level": r.pvImpactLevel,
-    "Publication / Item Title": r.title,
-    "AI PV Screening Summary": r.pvSummary,
-    "Recommended Next Step": r.recommendedAction,
-    "Item URL": r.itemUrl,
-    "Supporting Doc URL": r.docUrl || "N/A",
-    "Bundled File": r.bundledFileName,
-    "Source Page": r.sourceUrl,
-    "Model Used": r.modelUsed
-  }));
-  const wsFindings = XLSX.utils.json_to_sheet(
-    findingsSheetData.length > 0
-      ? findingsSheetData
-      : [{ Note: "No matching items found in the selected date range." }]
-  );
-  XLSX.utils.book_append_sheet(wb, wsFindings, "PV_Monitoring_Report");
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: "Missing GEMINI_API_KEY in Netlify environment variables." })
+    };
+  }
 
-  // Sheet 3: Source Status Log
-  const safeSources =
-    Array.isArray(sourceStatuses) && sourceStatuses.length > 0
-      ? sourceStatuses
-      : [{ Note: "No source status entries recorded." }];
-  const wsSources = XLSX.utils.json_to_sheet(safeSources);
-  XLSX.utils.book_append_sheet(wb, wsSources, "Source_Log");
+  try {
+    const {
+      urls = [],
+      ingredients = [],
+      startDate,
+      endDate,
+      includeUndated = true,
+      model = DEFAULT_MODEL
+    } = JSON.parse(event.body || "{}");
 
-  const excelArrayBuffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-  zip.file("Regulance_PV_Report.xlsx", excelArrayBuffer);
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return { statusCode: 400, body: JSON.stringify({ error: "Provide at least one target URL." }) };
+    }
+    if (!Array.isArray(ingredients) || ingredients.length === 0) {
+      return { statusCode: 400, body: JSON.stringify({ error: "Upload an Excel sheet with active ingredients." }) };
+    }
+    if (!startDate || !endDate || startDate > endDate) {
+      return { statusCode: 400, body: JSON.stringify({ error: "Provide a valid startDate <= endDate." }) };
+    }
 
-  onProgress("Compressing ZIP archive in browser memory...");
-  return await zip.generateAsync({ type: "blob" });
+    const findings = [];
+    const sourceStatuses = [];
+
+    for (const rawUrl of urls.slice(0, 2)) {
+      const cleanUrl = String(rawUrl || "").trim();
+      if (!isSafeExternalUrl(cleanUrl)) {
+        sourceStatuses.push({ url: cleanUrl, status: "Skipped (Invalid/Unsafe URL)" });
+        continue;
+      }
+
+      try {
+        const listingHtml = await fetchTextWithTimeout(cleanUrl);
+        const discoveredLinks = extractArticleLinksFromListing(listingHtml, cleanUrl);
+
+        const inWindowArticles = discoveredLinks.filter((item) => {
+          if (!item.listingDate) return Boolean(includeUndated);
+          return isDateInRange(item.listingDate, startDate, endDate);
+        });
+
+        const articlesToInspect = (
+          inWindowArticles.length > 0 ? inWindowArticles : discoveredLinks
+        ).slice(0, MAX_ARTICLES_PER_SOURCE);
+
+        let keptCount = 0;
+
+        for (const linkItem of articlesToInspect) {
+          try {
+            const articleHtml = await fetchTextWithTimeout(linkItem.url);
+            const details = extractArticleDetails(articleHtml, linkItem.url);
+            const effectiveDate = details.articleDate || linkItem.listingDate || "";
+
+            if (effectiveDate && !isDateInRange(effectiveDate, startDate, endDate)) {
+              continue;
+            }
+            if (!effectiveDate && !includeUndated) {
+              continue;
+            }
+
+            const ai = await assessArticleWithGemini({
+              apiKey,
+              model,
+              article: {
+                url: linkItem.url,
+                title: details.title || linkItem.title,
+                rawDateHint: effectiveDate || linkItem.rawDateHint,
+                textExcerpt: details.textExcerpt,
+                docLinks: details.docLinks
+              },
+              sourceUrl: cleanUrl,
+              ingredients,
+              startDate,
+              endDate,
+              includeUndated
+            });
+
+            if (!ai.isRelevant) continue;
+            if (ai.dateStatus === "Out of Range") continue;
+            if (ai.dateStatus === "Undated - Verify Manually" && !includeUndated) continue;
+
+            const validDocUrls = new Set(details.docLinks.map((d) => d.url));
+            const chosenDocUrl =
+              ai.selectedDocUrl && validDocUrls.has(ai.selectedDocUrl)
+                ? ai.selectedDocUrl
+                : details.docLinks[0]?.url || "";
+
+            const matchedList =
+              Array.isArray(ai.matchedIngredients) && ai.matchedIngredients.length > 0
+                ? ai.matchedIngredients
+                : ingredients;
+
+            keptCount += 1;
+            findings.push({
+              sourceUrl: cleanUrl,
+              itemUrl: linkItem.url,
+              docUrl: chosenDocUrl,
+              title: details.title || linkItem.title,
+              matchedIngredients: matchedList.join(", "),
+              extractedDate: ai.extractedDate || effectiveDate || "Unknown",
+              dateStatus:
+                ai.dateStatus ||
+                (effectiveDate ? "In Range" : "Undated - Verify Manually"),
+              pvImpactLevel: ai.pvImpactLevel || "Low",
+              pvSummary: ai.pvSummary || "",
+              recommendedAction: ai.recommendedAction || "",
+              modelUsed: (model && String(model).trim()) || DEFAULT_MODEL
+            });
+          } catch {
+            // Skip individual article errors so one slow/blocked page doesn't fail the whole run
+          }
+        }
+
+        sourceStatuses.push({
+          url: cleanUrl,
+          status: `Discovered ${discoveredLinks.length} link(s), checked ${articlesToInspect.length}, kept ${keptCount} relevant finding(s)`
+        });
+      } catch (err) {
+        sourceStatuses.push({
+          url: cleanUrl,
+          status: `Error: ${err.message}`
+        });
+      }
+    }
+
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        findings,
+        sourceStatuses,
+        assessedAt: new Date().toISOString()
+      })
+    };
+  } catch (err) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: err.message || "Unexpected monitoring error." })
+    };
+  }
 }
