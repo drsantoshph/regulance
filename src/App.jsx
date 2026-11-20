@@ -254,6 +254,23 @@ export default function App() {
             ))}
           </ul>
 
+          {Array.isArray(results.checkLog) && results.checkLog.length > 0 && (
+            <div style={{ marginTop: "1rem", marginBottom: "1.25rem" }}>
+              <h3>Checked Articles Log ({results.checkLog.length})</h3>
+              <ul style={{ paddingLeft: "1.25rem" }}>
+                {results.checkLog.map((entry, idx) => (
+                  <li key={idx} style={{ marginBottom: 8, fontSize: 13 }}>
+                    <strong>{entry.title}</strong> ({entry.date}) — <em>{entry.outcome}</em>
+                    <div>
+                      <code>{entry.articleUrl}</code>
+                      {entry.docUrl && entry.docUrl !== "None found" ? ` | Doc: ${entry.docUrl}` : ""}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <h2>Screened Findings ({(results.findings || []).length})</h2>
           {(results.findings || []).map((f, idx) => (
             <div key={idx} style={{ border: "1px solid #e5e7eb", borderRadius: 6, padding: "0.75rem", marginBottom: "0.75rem" }}>
