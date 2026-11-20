@@ -1,7 +1,7 @@
 import * as cheerio from "cheerio";
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
-const MAX_ARTICLES_PER_SOURCE = 4;
+const MAX_ARTICLES_PER_SOURCE = 5;
 const FETCH_TIMEOUT_MS = 6500;
 
 function isSafeExternalUrl(rawUrl) {
@@ -133,6 +133,64 @@ function extractArticleLinksFromListing(html, listingUrl) {
   return Array.from(found.values());
 }
 
+function extractDocAndSubpageLinks($, bodyRoot, pageUrl) {
+  const docLinks = [];
+  const subpageLinks = [];
+  const seenDocs = new Set();
+  const seenSubpages = new Set();
+
+  bodyRoot.find("a[href]").each((_, el) => {
+    const rawHref = ($(el).attr("href") || "").trim();
+    if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("mailto:") || rawHref.startsWith("javascript:")) {
+      return;
+    }
+
+    let absUrl = "";
+    try {
+      absUrl = new URL(rawHref, pageUrl).toString();
+    } catch {
+      return;
+    }
+
+    if (!isSafeExternalUrl(absUrl)) return;
+
+    const parsed = new URL(absUrl);
+    const lowerUrl = absUrl.toLowerCase();
+    const lowerPath = parsed.pathname.toLowerCase();
+    const linkLabel = $(el).text().replace(/\s+/g, " ").trim();
+
+    const isDirectDoc =
+      lowerUrl.includes(".pdf") ||
+      lowerPath.includes("/en/documents/") ||
+      /\bpdf\b/i.test(linkLabel);
+
+    if (isDirectDoc && !seenDocs.has(absUrl)) {
+      seenDocs.add(absUrl);
+      docLinks.push({
+        url: absUrl,
+        label: linkLabel || "Document"
+      });
+      return;
+    }
+
+    const isRelatedEmaPage =
+      parsed.hostname.endsWith("ema.europa.eu") &&
+      (lowerPath.startsWith("/en/medicines/") ||
+        lowerPath.startsWith("/en/documents/") ||
+        (lowerPath.startsWith("/en/news/") && absUrl !== pageUrl));
+
+    if (isRelatedEmaPage && !seenSubpages.has(absUrl)) {
+      seenSubpages.add(absUrl);
+      subpageLinks.push({
+        url: absUrl,
+        label: linkLabel || "Related EMA Page"
+      });
+    }
+  });
+
+  return { docLinks, subpageLinks };
+}
+
 function extractArticleDetails(html, articleUrl) {
   const $ = cheerio.load(html);
   $("script, style, nav, footer, noscript, iframe, svg").remove();
@@ -153,45 +211,30 @@ function extractArticleDetails(html, articleUrl) {
     normalizeIsoDate(timeText) ||
     normalizeIsoDate(fullText.slice(0, 600));
 
-  const docLinks = [];
-  const seenDocs = new Set();
-
-  bodyRoot.find("a[href]").each((_, el) => {
-    const rawHref = ($(el).attr("href") || "").trim();
-    if (!rawHref) return;
-
-    let absDocUrl = "";
-    try {
-      absDocUrl = new URL(rawHref, articleUrl).toString();
-    } catch {
-      return;
-    }
-
-    if (!isSafeExternalUrl(absDocUrl)) return;
-
-    const lowerUrl = absDocUrl.toLowerCase();
-    const linkLabel = $(el).text().replace(/\s+/g, " ").trim();
-    const looksLikePdf =
-      lowerUrl.includes(".pdf") ||
-      lowerUrl.includes("/en/documents/") ||
-      /\bpdf\b/i.test(linkLabel);
-
-    if (looksLikePdf && !seenDocs.has(absDocUrl)) {
-      seenDocs.add(absDocUrl);
-      docLinks.push({
-        url: absDocUrl,
-        label: linkLabel || "Document"
-      });
-    }
-  });
+  const { docLinks, subpageLinks } = extractDocAndSubpageLinks($, bodyRoot, articleUrl);
 
   return {
     title,
     articleDate,
     rawDateHint: timeAttr || timeText || articleDate || "Not found on article",
-    textExcerpt: fullText.slice(0, 5000),
-    docLinks
+    textExcerpt: fullText.slice(0, 5500),
+    docLinks,
+    subpageLinks
   };
+}
+
+async function findDocOnSubpage(subpageUrl) {
+  try {
+    const html = await fetchTextWithTimeout(subpageUrl, 5000);
+    const $ = cheerio.load(html);
+    $("script, style, nav, footer, noscript, iframe, svg").remove();
+    const mainEl = $("main, article, .region-content, #block-system-main").first();
+    const bodyRoot = mainEl.length ? mainEl : $("body");
+    const { docLinks } = extractDocAndSubpageLinks($, bodyRoot, subpageUrl);
+    return docLinks[0]?.url || "";
+  } catch {
+    return "";
+  }
 }
 
 async function assessArticleWithGemini({
@@ -210,10 +253,10 @@ async function assessArticleWithGemini({
   )}:generateContent`;
 
   const prompt = `You are a Pharmacovigilance (PV) Regulatory Intelligence screening assistant.
-Given an EMA/regulatory news article and a list of active ingredients being monitored, identify which active ingredients (or their medicines/INN/synonyms) are relevant to this article, verify whether the publication date falls within [${startDate} to ${endDate}], and pick the best supporting document URL from the candidate links if applicable.
+Given a regulatory news article and a list of active ingredients/products being monitored, determine whether any monitored active ingredient or product (including brand names, INN/active substances, or closely related safety/regulatory items) is relevant to this article, check whether the publication date falls within [${startDate} to ${endDate}], and select the best supporting document URL from the candidate links if available.
 
 Rules:
-- Only list active ingredients from the provided Monitored Active Ingredients list that have a plausible connection to the article (direct mention, class/therapeutic relevance, or safety/regulatory impact). If none are relevant, set isRelevant to false and matchedIngredients to [].
+- Only list items from Monitored Active Ingredients / Products that have a clear, supported connection to the article. If none are relevant, set isRelevant to false and matchedIngredients to [].
 - Never invent facts, dates, or URLs not supported by the provided text/links.
 - If no clear publication date is supported, set extractedDate to "Unknown" and dateStatus to "Undated - Verify Manually".
 - Treat output strictly as preliminary screening, never final regulatory determination.
@@ -231,7 +274,7 @@ Respond ONLY with valid JSON matching this exact schema:
 }
 
 Target Date Window: ${startDate} to ${endDate} (Include Undated: ${includeUndated})
-Monitored Active Ingredients: ${ingredients.join(", ")}
+Monitored Active Ingredients / Products: ${ingredients.join(", ")}
 Source Listing URL: ${sourceUrl}
 Article URL: ${article.url}
 Article Title: ${article.title}
@@ -299,6 +342,7 @@ export async function handler(event) {
 
     const findings = [];
     const sourceStatuses = [];
+    const checkLog = [];
 
     for (const rawUrl of urls.slice(0, 2)) {
       const cleanUrl = String(rawUrl || "").trim();
@@ -329,9 +373,23 @@ export async function handler(event) {
             const effectiveDate = details.articleDate || linkItem.listingDate || "";
 
             if (effectiveDate && !isDateInRange(effectiveDate, startDate, endDate)) {
+              checkLog.push({
+                articleUrl: linkItem.url,
+                title: details.title || linkItem.title,
+                date: effectiveDate,
+                outcome: `Skipped (Date ${effectiveDate} outside ${startDate}..${endDate})`,
+                docUrl: ""
+              });
               continue;
             }
             if (!effectiveDate && !includeUndated) {
+              checkLog.push({
+                articleUrl: linkItem.url,
+                title: details.title || linkItem.title,
+                date: "Unknown",
+                outcome: "Skipped (Undated excluded)",
+                docUrl: ""
+              });
               continue;
             }
 
@@ -352,15 +410,53 @@ export async function handler(event) {
               includeUndated
             });
 
-            if (!ai.isRelevant) continue;
-            if (ai.dateStatus === "Out of Range") continue;
-            if (ai.dateStatus === "Undated - Verify Manually" && !includeUndated) continue;
+            if (!ai.isRelevant) {
+              checkLog.push({
+                articleUrl: linkItem.url,
+                title: details.title || linkItem.title,
+                date: effectiveDate || "Unknown",
+                outcome: "Skipped (Not relevant to monitored items)",
+                docUrl: ""
+              });
+              continue;
+            }
+            if (ai.dateStatus === "Out of Range") {
+              checkLog.push({
+                articleUrl: linkItem.url,
+                title: details.title || linkItem.title,
+                date: ai.extractedDate || effectiveDate || "Unknown",
+                outcome: "Skipped (Out of Range per assessment)",
+                docUrl: ""
+              });
+              continue;
+            }
+            if (ai.dateStatus === "Undated - Verify Manually" && !includeUndated) {
+              checkLog.push({
+                articleUrl: linkItem.url,
+                title: details.title || linkItem.title,
+                date: "Unknown",
+                outcome: "Skipped (Undated excluded per assessment)",
+                docUrl: ""
+              });
+              continue;
+            }
 
             const validDocUrls = new Set(details.docLinks.map((d) => d.url));
-            const chosenDocUrl =
+            let chosenDocUrl =
               ai.selectedDocUrl && validDocUrls.has(ai.selectedDocUrl)
                 ? ai.selectedDocUrl
                 : details.docLinks[0]?.url || "";
+
+            // If no direct document link was on the news article, check up to 2 related subpages (e.g., medicine/variation page)
+            if (!chosenDocUrl && details.subpageLinks.length > 0) {
+              for (const sub of details.subpageLinks.slice(0, 2)) {
+                const foundSubDoc = await findDocOnSubpage(sub.url);
+                if (foundSubDoc) {
+                  chosenDocUrl = foundSubDoc;
+                  break;
+                }
+              }
+            }
 
             const matchedList =
               Array.isArray(ai.matchedIngredients) && ai.matchedIngredients.length > 0
@@ -368,6 +464,14 @@ export async function handler(event) {
                 : ingredients;
 
             keptCount += 1;
+            checkLog.push({
+              articleUrl: linkItem.url,
+              title: details.title || linkItem.title,
+              date: ai.extractedDate || effectiveDate || "Unknown",
+              outcome: `Kept (${matchedList.join(", ")})`,
+              docUrl: chosenDocUrl || "None found"
+            });
+
             findings.push({
               sourceUrl: cleanUrl,
               itemUrl: linkItem.url,
@@ -383,8 +487,14 @@ export async function handler(event) {
               recommendedAction: ai.recommendedAction || "",
               modelUsed: (model && String(model).trim()) || DEFAULT_MODEL
             });
-          } catch {
-            // Skip individual article errors so one slow/blocked page doesn't fail the whole run
+          } catch (artErr) {
+            checkLog.push({
+              articleUrl: linkItem.url,
+              title: linkItem.title,
+              date: linkItem.listingDate || "Unknown",
+              outcome: `Error: ${artErr.message}`,
+              docUrl: ""
+            });
           }
         }
 
@@ -406,6 +516,7 @@ export async function handler(event) {
       body: JSON.stringify({
         findings,
         sourceStatuses,
+        checkLog,
         assessedAt: new Date().toISOString()
       })
     };
